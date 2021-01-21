@@ -7,9 +7,9 @@ Object.defineProperty(exports, "__esModule", {
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
 
-var _hwTransportU2f = require('@ledgerhq/hw-transport-u2f');
+var _WebSocketTransport = require('@ledgerhq/hw-transport-http/lib/WebSocketTransport');
 
-var _hwTransportU2f2 = _interopRequireDefault(_hwTransportU2f);
+var _WebSocketTransport2 = _interopRequireDefault(_WebSocketTransport);
 
 var _hwAppEth = require('@ledgerhq/hw-app-eth');
 
@@ -23,10 +23,15 @@ function _classCallCheck(instance, Constructor) { if (!(instance instanceof Cons
 
 require('buffer');
 
+var BRIDGE_URL = "ws://localhost:8435";
+var TRANSPORT_CHECK_LIMIT = 10;
+var TRANSPORT_CHECK_DELAY = 1000;
+
 var LedgerBridge = function () {
     function LedgerBridge() {
         _classCallCheck(this, LedgerBridge);
 
+        console.log('[LedgerBridge][constructor] called!');
         this.addEventListeners();
     }
 
@@ -35,7 +40,9 @@ var LedgerBridge = function () {
         value: function addEventListeners() {
             var _this = this;
 
+            console.log('[LedgerBridge][addListeners] called!');
             window.addEventListener('message', async function (e) {
+                console.log('[LedgerBridge][addListeners] message received!', e.data, e);
                 if (e && e.data && e.data.target === 'LEDGER-IFRAME') {
                     var _e$data = e.data,
                         action = _e$data.action,
@@ -52,6 +59,9 @@ var LedgerBridge = function () {
                         case 'ledger-sign-personal-message':
                             _this.signPersonalMessage(replyAction, params.hdPath, params.message);
                             break;
+                        case 'ledger-close-bridge':
+                            _this.cleanUp(replyAction);
+                            break;
                     }
                 }
             }, false);
@@ -59,30 +69,77 @@ var LedgerBridge = function () {
     }, {
         key: 'sendMessageToExtension',
         value: function sendMessageToExtension(msg) {
+            console.log('[LedgerBridge][sendMessageToExtension] message!', msg);
             window.parent.postMessage(msg, '*');
         }
     }, {
+        key: 'delay',
+        value: function delay(ms) {
+            return new Promise(function (success) {
+                return setTimeout(success, ms);
+            });
+        }
+    }, {
+        key: 'checkTransportLoop',
+        value: function checkTransportLoop(i) {
+            var _this2 = this;
+
+            var iterator = i ? i : 0;
+            return _WebSocketTransport2.default.check(BRIDGE_URL).catch(async function () {
+                console.log('[LedgerBridge][WebSocketTransport.check.catch] message!', i);
+                await _this2.delay(TRANSPORT_CHECK_DELAY);
+                if (iterator < TRANSPORT_CHECK_LIMIT) {
+                    return _this2.checkTransportLoop(iterator + 1);
+                } else {
+                    throw new Error('Ledger transport check timeout');
+                }
+            });
+        }
+    }, {
         key: 'makeApp',
-        value: async function makeApp() {
+        value: async function makeApp(replyAction) {
+            var _this3 = this;
+
+            console.log('[LedgerBridge][makeApp] called! replyAction:', replyAction);
             try {
-                this.transport = await _hwTransportU2f2.default.create();
-                this.app = new _hwAppEth2.default(this.transport);
+                await _WebSocketTransport2.default.check(BRIDGE_URL).catch(async function () {
+                    console.log('[LedgerBridge][makeApp] WebSocketTransport catch');
+                    window.open('ledgerlive://bridge?appName=Ethereum');
+                    await _this3.checkTransportLoop();
+                    _this3.transport = await _WebSocketTransport2.default.open(BRIDGE_URL);
+                    _this3.app = new _hwAppEth2.default(_this3.transport);
+                    console.log('[LedgerBridge][makeApp] this.transport, app: ', _this3.transport, _this3.app);
+                });
             } catch (e) {
                 console.log('LEDGER:::CREATE APP ERROR', e);
+                this.cleanUp();
+                throw e;
             }
         }
     }, {
         key: 'cleanUp',
-        value: function cleanUp() {
+        value: function cleanUp(replyAction) {
+            console.log('[LedgerBridge][cleanUp] called');
             this.app = null;
-            this.transport.close();
+            if (this.transport) {
+                this.transport.close();
+            }
+            if (replyAction) {
+                this.sendMessageToExtension({
+                    action: replyAction,
+                    success: true
+                });
+            }
         }
     }, {
         key: 'unlock',
         value: async function unlock(replyAction, hdPath) {
+            console.log('[LedgerBridge][unlock] called');
             try {
                 await this.makeApp();
                 var res = await this.app.getAddress(hdPath, false, true);
+
+                console.log('[LedgerBridge][unlock] this.app.getAddress res:', res);
 
                 this.sendMessageToExtension({
                     action: replyAction,
@@ -90,6 +147,7 @@ var LedgerBridge = function () {
                     payload: res
                 });
             } catch (err) {
+                console.log('[LedgerBridge][unlock] error:', err);
                 var e = this.ledgerErrToMessage(err);
 
                 this.sendMessageToExtension({
@@ -97,13 +155,12 @@ var LedgerBridge = function () {
                     success: false,
                     payload: { error: e.toString() }
                 });
-            } finally {
-                this.cleanUp();
             }
         }
     }, {
         key: 'signTransaction',
         value: async function signTransaction(replyAction, hdPath, tx, to) {
+            console.log('[LedgerBridge][signTransaction] called:', replyAction, hdPath, tx, to);
             try {
                 await this.makeApp();
                 if (to) {
@@ -111,28 +168,32 @@ var LedgerBridge = function () {
                     if (isKnownERC20Token) await this.app.provideERC20TokenInformation(isKnownERC20Token);
                 }
                 var res = await this.app.signTransaction(hdPath, tx);
+
+                console.log('[LedgerBridge][signTransaction] res:', res);
                 this.sendMessageToExtension({
                     action: replyAction,
                     success: true,
                     payload: res
                 });
             } catch (err) {
+                console.log('[LedgerBridge][signTransaction] err:', err);
                 var e = this.ledgerErrToMessage(err);
                 this.sendMessageToExtension({
                     action: replyAction,
                     success: false,
                     payload: { error: e.toString() }
                 });
-            } finally {
-                this.cleanUp();
             }
         }
     }, {
         key: 'signPersonalMessage',
         value: async function signPersonalMessage(replyAction, hdPath, message) {
+            console.log('[LedgerBridge][signPersonalMessage] called:', replyAction, hdPath, message);
             try {
                 await this.makeApp();
                 var res = await this.app.signPersonalMessage(hdPath, message);
+
+                console.log('[LedgerBridge][signPersonalMessage] res:', res);
 
                 this.sendMessageToExtension({
                     action: replyAction,
@@ -140,14 +201,13 @@ var LedgerBridge = function () {
                     payload: res
                 });
             } catch (err) {
+                console.log('[LedgerBridge][signPersonalMessage] error:', err);
                 var e = this.ledgerErrToMessage(err);
                 this.sendMessageToExtension({
                     action: replyAction,
                     success: false,
                     payload: { error: e.toString() }
                 });
-            } finally {
-                this.cleanUp();
             }
         }
     }, {
@@ -158,6 +218,12 @@ var LedgerBridge = function () {
             };
             var isStringError = function isStringError(err) {
                 return typeof err === 'string';
+            };
+            var isWrongAppError = function isWrongAppError(err) {
+                return err.message && err.message.includes('6804');
+            };
+            var isLedgerLockedError = function isLedgerLockedError(err) {
+                return err.message && err.message.includes('OpenFailed');
             };
             var isErrorWithId = function isErrorWithId(err) {
                 return err.hasOwnProperty('id') && err.hasOwnProperty('message');
@@ -171,6 +237,13 @@ var LedgerBridge = function () {
                 }
 
                 return err.metaData.type;
+            }
+
+            if (isWrongAppError(err)) {
+                return 'LEDGER_WRONG_APP';
+            }
+            if (isLedgerLockedError(err)) {
+                return 'LEDGER_LOCKED';
             }
 
             if (isStringError(err)) {
@@ -203,7 +276,7 @@ var LedgerBridge = function () {
 
 exports.default = LedgerBridge;
 
-},{"@ledgerhq/hw-app-eth":6,"@ledgerhq/hw-app-eth/erc20":5,"@ledgerhq/hw-transport-u2f":9,"buffer":16}],2:[function(require,module,exports){
+},{"@ledgerhq/hw-app-eth":6,"@ledgerhq/hw-app-eth/erc20":5,"@ledgerhq/hw-transport-http/lib/WebSocketTransport":9,"buffer":17}],2:[function(require,module,exports){
 'use strict';
 
 var _ledgerBridge = require('./ledger-bridge');
@@ -215,7 +288,7 @@ function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { de
 (async function () {
     var bridge = new _ledgerBridge2.default();
 })();
-console.log('MetaMask < = > Ledger Bridge initialized!');
+console.log('MetaMask < = > Ledger Bridge initialized! - new version DW!');
 
 },{"./ledger-bridge":1}],3:[function(require,module,exports){
 'use strict';
@@ -1048,7 +1121,7 @@ class Eth {
 exports.default = Eth;
 
 }).call(this,require("buffer").Buffer)
-},{"./utils":8,"@ledgerhq/errors":3,"bignumber.js":13,"buffer":16,"rlp":19}],7:[function(require,module,exports){
+},{"./utils":8,"@ledgerhq/errors":3,"bignumber.js":14,"buffer":17,"rlp":20}],7:[function(require,module,exports){
 (function (Buffer){
 "use strict";
 
@@ -1130,7 +1203,7 @@ const get = (() => {
 })();
 
 }).call(this,require("buffer").Buffer)
-},{"../data/erc20.js":4,"buffer":16}],8:[function(require,module,exports){
+},{"../data/erc20.js":4,"buffer":17}],8:[function(require,module,exports){
 "use strict";
 
 Object.defineProperty(exports, "__esModule", {
@@ -1236,7 +1309,7 @@ function asyncWhile(predicate, callback) {
 }
 
 },{}],9:[function(require,module,exports){
-(function (Buffer){
+(function (global,Buffer){
 "use strict";
 
 Object.defineProperty(exports, "__esModule", {
@@ -1244,188 +1317,541 @@ Object.defineProperty(exports, "__esModule", {
 });
 exports.default = void 0;
 
-var _u2fApi = require("u2f-api");
-
 var _hwTransport = _interopRequireDefault(require("@ledgerhq/hw-transport"));
-
-var _logs = require("@ledgerhq/logs");
 
 var _errors = require("@ledgerhq/errors");
 
+var _logs = require("@ledgerhq/logs");
+
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
-function wrapU2FTransportError(originalError, message, id) {
-  const err = new _errors.TransportError(message, id); // $FlowFixMe
-
-  err.originalError = originalError;
-  return err;
-}
-
-function wrapApdu(apdu, key) {
-  const result = Buffer.alloc(apdu.length);
-
-  for (let i = 0; i < apdu.length; i++) {
-    result[i] = apdu[i] ^ key[i % key.length];
-  }
-
-  return result;
-} // Convert from normal to web-safe, strip trailing "="s
-
-
-const webSafe64 = base64 => base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); // Convert from web-safe to normal, add trailing "="s
-
-
-const normal64 = base64 => base64.replace(/-/g, "+").replace(/_/g, "/") + "==".substring(0, 3 * base64.length % 4);
-
-function attemptExchange(apdu, timeoutMillis, scrambleKey, unwrap) {
-  const keyHandle = wrapApdu(apdu, scrambleKey);
-  const challenge = Buffer.from("0000000000000000000000000000000000000000000000000000000000000000", "hex");
-  const signRequest = {
-    version: "U2F_V2",
-    keyHandle: webSafe64(keyHandle.toString("base64")),
-    challenge: webSafe64(challenge.toString("base64")),
-    appId: location.origin
-  };
-  (0, _logs.log)("apdu", "=> " + apdu.toString("hex"));
-  return (0, _u2fApi.sign)(signRequest, timeoutMillis / 1000).then(response => {
-    const {
-      signatureData
-    } = response;
-
-    if (typeof signatureData === "string") {
-      const data = Buffer.from(normal64(signatureData), "base64");
-      let result;
-
-      if (!unwrap) {
-        result = data;
-      } else {
-        result = data.slice(5);
-      }
-
-      (0, _logs.log)("apdu", "<= " + result.toString("hex"));
-      return result;
-    } else {
-      throw response;
-    }
-  });
-}
-
-let transportInstances = [];
-
-function emitDisconnect() {
-  transportInstances.forEach(t => t.emit("disconnect"));
-  transportInstances = [];
-}
-
-function isTimeoutU2FError(u2fError) {
-  return u2fError.metaData.code === 5;
-}
+const WebSocket = global.WebSocket || require("ws");
 /**
- * U2F web Transport implementation
- * @example
- * import TransportU2F from "@ledgerhq/hw-transport-u2f";
- * ...
- * TransportU2F.create().then(transport => ...)
+ * WebSocket transport implementation
  */
 
 
-class TransportU2F extends _hwTransport.default {
-  /*
-   */
+class WebSocketTransport extends _hwTransport.default {
+  // this transport is not discoverable
+  static async open(url) {
+    const exchangeMethods = await new Promise((resolve, reject) => {
+      try {
+        const socket = new WebSocket(url);
+        const exchangeMethods = {
+          resolveExchange: _b => {},
+          rejectExchange: _e => {},
+          onDisconnect: () => {},
+          close: () => socket.close(),
+          send: msg => socket.send(msg)
+        };
 
-  /*
-   */
+        socket.onopen = () => {
+          socket.send("open");
+        };
 
-  /**
-   * static function to create a new Transport from a connected Ledger device discoverable via U2F (browser support)
-   */
-  static async open(_, _openTimeout = 5000) {
-    return new TransportU2F();
+        socket.onerror = e => {
+          exchangeMethods.onDisconnect();
+          reject(e);
+        };
+
+        socket.onclose = () => {
+          exchangeMethods.onDisconnect();
+          reject(new _errors.TransportError("OpenFailed", "OpenFailed"));
+        };
+
+        socket.onmessage = e => {
+          if (typeof e.data !== "string") return;
+          const data = JSON.parse(e.data);
+
+          switch (data.type) {
+            case "opened":
+              return resolve(exchangeMethods);
+
+            case "error":
+              reject(new Error(data.error));
+              return exchangeMethods.rejectExchange(new _errors.TransportError(data.error, "WSError"));
+
+            case "response":
+              return exchangeMethods.resolveExchange(Buffer.from(data.data, "hex"));
+          }
+        };
+      } catch (e) {
+        reject(e);
+      }
+    });
+    return new WebSocketTransport(exchangeMethods);
   }
 
-  constructor() {
+  constructor(hook) {
     super();
-    this.scrambleKey = void 0;
-    this.unwrap = true;
-    transportInstances.push(this);
-  }
-  /**
-   * Exchange with the device using APDU protocol.
-   * @param apdu
-   * @returns a promise of apdu response
-   */
+    this.hook = void 0;
+    this.hook = hook;
 
+    hook.onDisconnect = () => {
+      this.emit("disconnect");
+      this.hook.rejectExchange(new _errors.TransportError("WebSocket disconnected", "WSDisconnect"));
+    };
+  }
 
   async exchange(apdu) {
-    try {
-      return await attemptExchange(apdu, this.exchangeTimeout, this.scrambleKey, this.unwrap);
-    } catch (e) {
-      const isU2FError = typeof e.metaData === "object";
+    const hex = apdu.toString("hex");
+    (0, _logs.log)("apdu", "=> " + hex);
+    const res = await new Promise((resolve, reject) => {
+      this.hook.rejectExchange = e => reject(e);
 
-      if (isU2FError) {
-        if (isTimeoutU2FError(e)) {
-          emitDisconnect();
-        } // the wrapping make error more usable and "printable" to the end user.
+      this.hook.resolveExchange = b => resolve(b);
 
-
-        throw wrapU2FTransportError(e, "Failed to sign with Ledger device: U2F " + e.metaData.type, "U2F_" + e.metaData.code);
-      } else {
-        throw e;
-      }
-    }
-  }
-  /**
-   */
-
-
-  setScrambleKey(scrambleKey) {
-    this.scrambleKey = Buffer.from(scrambleKey, "ascii");
-  }
-  /**
-   */
-
-
-  setUnwrap(unwrap) {
-    this.unwrap = unwrap;
+      this.hook.send(hex);
+    });
+    (0, _logs.log)("apdu", "<= " + res.toString("hex"));
+    return res;
   }
 
-  close() {
-    // u2f have no way to clean things up
-    return Promise.resolve();
+  setScrambleKey() {}
+
+  async close() {
+    this.hook.close();
+    return new Promise(success => {
+      setTimeout(success, 200);
+    });
   }
 
 }
 
-exports.default = TransportU2F;
-TransportU2F.isSupported = _u2fApi.isSupported;
+exports.default = WebSocketTransport;
 
-TransportU2F.list = () => // this transport is not discoverable but we are going to guess if it is here with isSupported()
-(0, _u2fApi.isSupported)().then(supported => supported ? [null] : []);
+WebSocketTransport.isSupported = () => Promise.resolve(typeof WebSocket === "function");
 
-TransportU2F.listen = observer => {
-  let unsubscribed = false;
-  (0, _u2fApi.isSupported)().then(supported => {
-    if (unsubscribed) return;
+WebSocketTransport.list = () => Promise.resolve([]);
 
-    if (supported) {
-      observer.next({
-        type: "add",
-        descriptor: null
-      });
-      observer.complete();
-    } else {
-      observer.error(new _errors.TransportError("U2F browser support is needed for Ledger. " + "Please use Chrome, Opera or Firefox with a U2F extension. " + "Also make sure you're on an HTTPS connection", "U2FNotSupported"));
-    }
-  });
-  return {
-    unsubscribe: () => {
-      unsubscribed = true;
+WebSocketTransport.listen = _observer => ({
+  unsubscribe: () => {}
+});
+
+WebSocketTransport.check = async (url, timeout = 5000) => new Promise((resolve, reject) => {
+  const socket = new WebSocket(url);
+  let success = false;
+  setTimeout(() => {
+    socket.close();
+  }, timeout);
+
+  socket.onopen = () => {
+    success = true;
+    socket.close();
+  };
+
+  socket.onclose = () => {
+    if (success) resolve();else {
+      reject(new _errors.TransportError("failed to access WebSocketTransport(" + url + ")", "WebSocketTransportNotAccessible"));
     }
   };
-};
 
-}).call(this,require("buffer").Buffer)
-},{"@ledgerhq/errors":3,"@ledgerhq/hw-transport":10,"@ledgerhq/logs":11,"buffer":16,"u2f-api":20}],10:[function(require,module,exports){
+  socket.onerror = () => {
+    reject(new _errors.TransportError("failed to access WebSocketTransport(" + url + "): error", "WebSocketTransportNotAccessible"));
+  };
+});
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer)
+},{"@ledgerhq/errors":10,"@ledgerhq/hw-transport":11,"@ledgerhq/logs":12,"buffer":17,"ws":21}],10:[function(require,module,exports){
+'use strict';
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+/* eslint-disable no-continue */
+/* eslint-disable no-unused-vars */
+/* eslint-disable no-param-reassign */
+/* eslint-disable no-prototype-builtins */
+var errorClasses = {};
+var deserializers = {};
+var addCustomErrorDeserializer = function (name, deserializer) {
+    deserializers[name] = deserializer;
+};
+var createCustomErrorClass = function (name) {
+    var C = function CustomError(message, fields) {
+        Object.assign(this, fields);
+        this.name = name;
+        this.message = message || name;
+        this.stack = new Error().stack;
+    };
+    C.prototype = new Error();
+    errorClasses[name] = C;
+    return C;
+};
+// inspired from https://github.com/programble/errio/blob/master/index.js
+var deserializeError = function (object) {
+    if (typeof object === "object" && object) {
+        try {
+            // $FlowFixMe FIXME HACK
+            var msg = JSON.parse(object.message);
+            if (msg.message && msg.name) {
+                object = msg;
+            }
+        }
+        catch (e) {
+            // nothing
+        }
+        var error = void 0;
+        if (typeof object.name === "string") {
+            var name_1 = object.name;
+            var des = deserializers[name_1];
+            if (des) {
+                error = des(object);
+            }
+            else {
+                var constructor = name_1 === "Error" ? Error : errorClasses[name_1];
+                if (!constructor) {
+                    console.warn("deserializing an unknown class '" + name_1 + "'");
+                    constructor = createCustomErrorClass(name_1);
+                }
+                error = Object.create(constructor.prototype);
+                try {
+                    for (var prop in object) {
+                        if (object.hasOwnProperty(prop)) {
+                            error[prop] = object[prop];
+                        }
+                    }
+                }
+                catch (e) {
+                    // sometimes setting a property can fail (e.g. .name)
+                }
+            }
+        }
+        else {
+            error = new Error(object.message);
+        }
+        if (!error.stack && Error.captureStackTrace) {
+            Error.captureStackTrace(error, deserializeError);
+        }
+        return error;
+    }
+    return new Error(String(object));
+};
+// inspired from https://github.com/sindresorhus/serialize-error/blob/master/index.js
+var serializeError = function (value) {
+    if (!value)
+        return value;
+    if (typeof value === "object") {
+        return destroyCircular(value, []);
+    }
+    if (typeof value === "function") {
+        return "[Function: " + (value.name || "anonymous") + "]";
+    }
+    return value;
+};
+// https://www.npmjs.com/package/destroy-circular
+function destroyCircular(from, seen) {
+    var to = {};
+    seen.push(from);
+    for (var _i = 0, _a = Object.keys(from); _i < _a.length; _i++) {
+        var key = _a[_i];
+        var value = from[key];
+        if (typeof value === "function") {
+            continue;
+        }
+        if (!value || typeof value !== "object") {
+            to[key] = value;
+            continue;
+        }
+        if (seen.indexOf(from[key]) === -1) {
+            to[key] = destroyCircular(from[key], seen.slice(0));
+            continue;
+        }
+        to[key] = "[Circular]";
+    }
+    if (typeof from.name === "string") {
+        to.name = from.name;
+    }
+    if (typeof from.message === "string") {
+        to.message = from.message;
+    }
+    if (typeof from.stack === "string") {
+        to.stack = from.stack;
+    }
+    return to;
+}
+
+var AccountNameRequiredError = createCustomErrorClass("AccountNameRequired");
+var AccountNotSupported = createCustomErrorClass("AccountNotSupported");
+var AmountRequired = createCustomErrorClass("AmountRequired");
+var BluetoothRequired = createCustomErrorClass("BluetoothRequired");
+var BtcUnmatchedApp = createCustomErrorClass("BtcUnmatchedApp");
+var CantOpenDevice = createCustomErrorClass("CantOpenDevice");
+var CashAddrNotSupported = createCustomErrorClass("CashAddrNotSupported");
+var CurrencyNotSupported = createCustomErrorClass("CurrencyNotSupported");
+var DeviceAppVerifyNotSupported = createCustomErrorClass("DeviceAppVerifyNotSupported");
+var DeviceGenuineSocketEarlyClose = createCustomErrorClass("DeviceGenuineSocketEarlyClose");
+var DeviceNotGenuineError = createCustomErrorClass("DeviceNotGenuine");
+var DeviceOnDashboardExpected = createCustomErrorClass("DeviceOnDashboardExpected");
+var DeviceOnDashboardUnexpected = createCustomErrorClass("DeviceOnDashboardUnexpected");
+var DeviceInOSUExpected = createCustomErrorClass("DeviceInOSUExpected");
+var DeviceHalted = createCustomErrorClass("DeviceHalted");
+var DeviceNameInvalid = createCustomErrorClass("DeviceNameInvalid");
+var DeviceSocketFail = createCustomErrorClass("DeviceSocketFail");
+var DeviceSocketNoBulkStatus = createCustomErrorClass("DeviceSocketNoBulkStatus");
+var DisconnectedDevice = createCustomErrorClass("DisconnectedDevice");
+var DisconnectedDeviceDuringOperation = createCustomErrorClass("DisconnectedDeviceDuringOperation");
+var EnpointConfigError = createCustomErrorClass("EnpointConfig");
+var EthAppPleaseEnableContractData = createCustomErrorClass("EthAppPleaseEnableContractData");
+var FeeEstimationFailed = createCustomErrorClass("FeeEstimationFailed");
+var FirmwareNotRecognized = createCustomErrorClass("FirmwareNotRecognized");
+var HardResetFail = createCustomErrorClass("HardResetFail");
+var InvalidXRPTag = createCustomErrorClass("InvalidXRPTag");
+var InvalidAddress = createCustomErrorClass("InvalidAddress");
+var InvalidAddressBecauseDestinationIsAlsoSource = createCustomErrorClass("InvalidAddressBecauseDestinationIsAlsoSource");
+var LatestMCUInstalledError = createCustomErrorClass("LatestMCUInstalledError");
+var UnknownMCU = createCustomErrorClass("UnknownMCU");
+var LedgerAPIError = createCustomErrorClass("LedgerAPIError");
+var LedgerAPIErrorWithMessage = createCustomErrorClass("LedgerAPIErrorWithMessage");
+var LedgerAPINotAvailable = createCustomErrorClass("LedgerAPINotAvailable");
+var ManagerAppAlreadyInstalledError = createCustomErrorClass("ManagerAppAlreadyInstalled");
+var ManagerAppRelyOnBTCError = createCustomErrorClass("ManagerAppRelyOnBTC");
+var ManagerAppDepInstallRequired = createCustomErrorClass("ManagerAppDepInstallRequired");
+var ManagerAppDepUninstallRequired = createCustomErrorClass("ManagerAppDepUninstallRequired");
+var ManagerDeviceLockedError = createCustomErrorClass("ManagerDeviceLocked");
+var ManagerFirmwareNotEnoughSpaceError = createCustomErrorClass("ManagerFirmwareNotEnoughSpace");
+var ManagerNotEnoughSpaceError = createCustomErrorClass("ManagerNotEnoughSpace");
+var ManagerUninstallBTCDep = createCustomErrorClass("ManagerUninstallBTCDep");
+var NetworkDown = createCustomErrorClass("NetworkDown");
+var NoAddressesFound = createCustomErrorClass("NoAddressesFound");
+var NotEnoughBalance = createCustomErrorClass("NotEnoughBalance");
+var NotEnoughBalanceToDelegate = createCustomErrorClass("NotEnoughBalanceToDelegate");
+var NotEnoughBalanceInParentAccount = createCustomErrorClass("NotEnoughBalanceInParentAccount");
+var NotEnoughSpendableBalance = createCustomErrorClass("NotEnoughSpendableBalance");
+var NotEnoughBalanceBecauseDestinationNotCreated = createCustomErrorClass("NotEnoughBalanceBecauseDestinationNotCreated");
+var NoAccessToCamera = createCustomErrorClass("NoAccessToCamera");
+var NotEnoughGas = createCustomErrorClass("NotEnoughGas");
+var NotSupportedLegacyAddress = createCustomErrorClass("NotSupportedLegacyAddress");
+var GasLessThanEstimate = createCustomErrorClass("GasLessThanEstimate");
+var PasswordsDontMatchError = createCustomErrorClass("PasswordsDontMatch");
+var PasswordIncorrectError = createCustomErrorClass("PasswordIncorrect");
+var RecommendSubAccountsToEmpty = createCustomErrorClass("RecommendSubAccountsToEmpty");
+var RecommendUndelegation = createCustomErrorClass("RecommendUndelegation");
+var TimeoutTagged = createCustomErrorClass("TimeoutTagged");
+var UnexpectedBootloader = createCustomErrorClass("UnexpectedBootloader");
+var MCUNotGenuineToDashboard = createCustomErrorClass("MCUNotGenuineToDashboard");
+var RecipientRequired = createCustomErrorClass("RecipientRequired");
+var UnavailableTezosOriginatedAccountReceive = createCustomErrorClass("UnavailableTezosOriginatedAccountReceive");
+var UnavailableTezosOriginatedAccountSend = createCustomErrorClass("UnavailableTezosOriginatedAccountSend");
+var UpdateFetchFileFail = createCustomErrorClass("UpdateFetchFileFail");
+var UpdateIncorrectHash = createCustomErrorClass("UpdateIncorrectHash");
+var UpdateIncorrectSig = createCustomErrorClass("UpdateIncorrectSig");
+var UpdateYourApp = createCustomErrorClass("UpdateYourApp");
+var UserRefusedDeviceNameChange = createCustomErrorClass("UserRefusedDeviceNameChange");
+var UserRefusedAddress = createCustomErrorClass("UserRefusedAddress");
+var UserRefusedFirmwareUpdate = createCustomErrorClass("UserRefusedFirmwareUpdate");
+var UserRefusedAllowManager = createCustomErrorClass("UserRefusedAllowManager");
+var UserRefusedOnDevice = createCustomErrorClass("UserRefusedOnDevice"); // TODO rename because it's just for transaction refusal
+var TransportOpenUserCancelled = createCustomErrorClass("TransportOpenUserCancelled");
+var TransportInterfaceNotAvailable = createCustomErrorClass("TransportInterfaceNotAvailable");
+var TransportRaceCondition = createCustomErrorClass("TransportRaceCondition");
+var TransportWebUSBGestureRequired = createCustomErrorClass("TransportWebUSBGestureRequired");
+var DeviceShouldStayInApp = createCustomErrorClass("DeviceShouldStayInApp");
+var WebsocketConnectionError = createCustomErrorClass("WebsocketConnectionError");
+var WebsocketConnectionFailed = createCustomErrorClass("WebsocketConnectionFailed");
+var WrongDeviceForAccount = createCustomErrorClass("WrongDeviceForAccount");
+var WrongAppForCurrency = createCustomErrorClass("WrongAppForCurrency");
+var ETHAddressNonEIP = createCustomErrorClass("ETHAddressNonEIP");
+var CantScanQRCode = createCustomErrorClass("CantScanQRCode");
+var FeeNotLoaded = createCustomErrorClass("FeeNotLoaded");
+var FeeRequired = createCustomErrorClass("FeeRequired");
+var FeeTooHigh = createCustomErrorClass("FeeTooHigh");
+var SyncError = createCustomErrorClass("SyncError");
+var PairingFailed = createCustomErrorClass("PairingFailed");
+var GenuineCheckFailed = createCustomErrorClass("GenuineCheckFailed");
+var LedgerAPI4xx = createCustomErrorClass("LedgerAPI4xx");
+var LedgerAPI5xx = createCustomErrorClass("LedgerAPI5xx");
+var FirmwareOrAppUpdateRequired = createCustomErrorClass("FirmwareOrAppUpdateRequired");
+// db stuff, no need to translate
+var NoDBPathGiven = createCustomErrorClass("NoDBPathGiven");
+var DBWrongPassword = createCustomErrorClass("DBWrongPassword");
+var DBNotReset = createCustomErrorClass("DBNotReset");
+/**
+ * TransportError is used for any generic transport errors.
+ * e.g. Error thrown when data received by exchanges are incorrect or if exchanged failed to communicate with the device for various reason.
+ */
+function TransportError(message, id) {
+    this.name = "TransportError";
+    this.message = message;
+    this.stack = new Error().stack;
+    this.id = id;
+}
+TransportError.prototype = new Error();
+addCustomErrorDeserializer("TransportError", function (e) { return new TransportError(e.message, e.id); });
+var StatusCodes = {
+    PIN_REMAINING_ATTEMPTS: 0x63c0,
+    INCORRECT_LENGTH: 0x6700,
+    MISSING_CRITICAL_PARAMETER: 0x6800,
+    COMMAND_INCOMPATIBLE_FILE_STRUCTURE: 0x6981,
+    SECURITY_STATUS_NOT_SATISFIED: 0x6982,
+    CONDITIONS_OF_USE_NOT_SATISFIED: 0x6985,
+    INCORRECT_DATA: 0x6a80,
+    NOT_ENOUGH_MEMORY_SPACE: 0x6a84,
+    REFERENCED_DATA_NOT_FOUND: 0x6a88,
+    FILE_ALREADY_EXISTS: 0x6a89,
+    INCORRECT_P1_P2: 0x6b00,
+    INS_NOT_SUPPORTED: 0x6d00,
+    CLA_NOT_SUPPORTED: 0x6e00,
+    TECHNICAL_PROBLEM: 0x6f00,
+    OK: 0x9000,
+    MEMORY_PROBLEM: 0x9240,
+    NO_EF_SELECTED: 0x9400,
+    INVALID_OFFSET: 0x9402,
+    FILE_NOT_FOUND: 0x9404,
+    INCONSISTENT_FILE: 0x9408,
+    ALGORITHM_NOT_SUPPORTED: 0x9484,
+    INVALID_KCV: 0x9485,
+    CODE_NOT_INITIALIZED: 0x9802,
+    ACCESS_CONDITION_NOT_FULFILLED: 0x9804,
+    CONTRADICTION_SECRET_CODE_STATUS: 0x9808,
+    CONTRADICTION_INVALIDATION: 0x9810,
+    CODE_BLOCKED: 0x9840,
+    MAX_VALUE_REACHED: 0x9850,
+    GP_AUTH_FAILED: 0x6300,
+    LICENSING: 0x6f42,
+    HALTED: 0x6faa,
+};
+function getAltStatusMessage(code) {
+    switch (code) {
+        // improve text of most common errors
+        case 0x6700:
+            return "Incorrect length";
+        case 0x6800:
+            return "Missing critical parameter";
+        case 0x6982:
+            return "Security not satisfied (dongle locked or have invalid access rights)";
+        case 0x6985:
+            return "Condition of use not satisfied (denied by the user?)";
+        case 0x6a80:
+            return "Invalid data received";
+        case 0x6b00:
+            return "Invalid parameter received";
+    }
+    if (0x6f00 <= code && code <= 0x6fff) {
+        return "Internal error, please report";
+    }
+}
+/**
+ * Error thrown when a device returned a non success status.
+ * the error.statusCode is one of the `StatusCodes` exported by this library.
+ */
+function TransportStatusError(statusCode) {
+    this.name = "TransportStatusError";
+    var statusText = Object.keys(StatusCodes).find(function (k) { return StatusCodes[k] === statusCode; }) ||
+        "UNKNOWN_ERROR";
+    var smsg = getAltStatusMessage(statusCode) || statusText;
+    var statusCodeStr = statusCode.toString(16);
+    this.message = "Ledger device: " + smsg + " (0x" + statusCodeStr + ")";
+    this.stack = new Error().stack;
+    this.statusCode = statusCode;
+    this.statusText = statusText;
+}
+TransportStatusError.prototype = new Error();
+addCustomErrorDeserializer("TransportStatusError", function (e) { return new TransportStatusError(e.statusCode); });
+
+exports.AccountNameRequiredError = AccountNameRequiredError;
+exports.AccountNotSupported = AccountNotSupported;
+exports.AmountRequired = AmountRequired;
+exports.BluetoothRequired = BluetoothRequired;
+exports.BtcUnmatchedApp = BtcUnmatchedApp;
+exports.CantOpenDevice = CantOpenDevice;
+exports.CantScanQRCode = CantScanQRCode;
+exports.CashAddrNotSupported = CashAddrNotSupported;
+exports.CurrencyNotSupported = CurrencyNotSupported;
+exports.DBNotReset = DBNotReset;
+exports.DBWrongPassword = DBWrongPassword;
+exports.DeviceAppVerifyNotSupported = DeviceAppVerifyNotSupported;
+exports.DeviceGenuineSocketEarlyClose = DeviceGenuineSocketEarlyClose;
+exports.DeviceHalted = DeviceHalted;
+exports.DeviceInOSUExpected = DeviceInOSUExpected;
+exports.DeviceNameInvalid = DeviceNameInvalid;
+exports.DeviceNotGenuineError = DeviceNotGenuineError;
+exports.DeviceOnDashboardExpected = DeviceOnDashboardExpected;
+exports.DeviceOnDashboardUnexpected = DeviceOnDashboardUnexpected;
+exports.DeviceShouldStayInApp = DeviceShouldStayInApp;
+exports.DeviceSocketFail = DeviceSocketFail;
+exports.DeviceSocketNoBulkStatus = DeviceSocketNoBulkStatus;
+exports.DisconnectedDevice = DisconnectedDevice;
+exports.DisconnectedDeviceDuringOperation = DisconnectedDeviceDuringOperation;
+exports.ETHAddressNonEIP = ETHAddressNonEIP;
+exports.EnpointConfigError = EnpointConfigError;
+exports.EthAppPleaseEnableContractData = EthAppPleaseEnableContractData;
+exports.FeeEstimationFailed = FeeEstimationFailed;
+exports.FeeNotLoaded = FeeNotLoaded;
+exports.FeeRequired = FeeRequired;
+exports.FeeTooHigh = FeeTooHigh;
+exports.FirmwareNotRecognized = FirmwareNotRecognized;
+exports.FirmwareOrAppUpdateRequired = FirmwareOrAppUpdateRequired;
+exports.GasLessThanEstimate = GasLessThanEstimate;
+exports.GenuineCheckFailed = GenuineCheckFailed;
+exports.HardResetFail = HardResetFail;
+exports.InvalidAddress = InvalidAddress;
+exports.InvalidAddressBecauseDestinationIsAlsoSource = InvalidAddressBecauseDestinationIsAlsoSource;
+exports.InvalidXRPTag = InvalidXRPTag;
+exports.LatestMCUInstalledError = LatestMCUInstalledError;
+exports.LedgerAPI4xx = LedgerAPI4xx;
+exports.LedgerAPI5xx = LedgerAPI5xx;
+exports.LedgerAPIError = LedgerAPIError;
+exports.LedgerAPIErrorWithMessage = LedgerAPIErrorWithMessage;
+exports.LedgerAPINotAvailable = LedgerAPINotAvailable;
+exports.MCUNotGenuineToDashboard = MCUNotGenuineToDashboard;
+exports.ManagerAppAlreadyInstalledError = ManagerAppAlreadyInstalledError;
+exports.ManagerAppDepInstallRequired = ManagerAppDepInstallRequired;
+exports.ManagerAppDepUninstallRequired = ManagerAppDepUninstallRequired;
+exports.ManagerAppRelyOnBTCError = ManagerAppRelyOnBTCError;
+exports.ManagerDeviceLockedError = ManagerDeviceLockedError;
+exports.ManagerFirmwareNotEnoughSpaceError = ManagerFirmwareNotEnoughSpaceError;
+exports.ManagerNotEnoughSpaceError = ManagerNotEnoughSpaceError;
+exports.ManagerUninstallBTCDep = ManagerUninstallBTCDep;
+exports.NetworkDown = NetworkDown;
+exports.NoAccessToCamera = NoAccessToCamera;
+exports.NoAddressesFound = NoAddressesFound;
+exports.NoDBPathGiven = NoDBPathGiven;
+exports.NotEnoughBalance = NotEnoughBalance;
+exports.NotEnoughBalanceBecauseDestinationNotCreated = NotEnoughBalanceBecauseDestinationNotCreated;
+exports.NotEnoughBalanceInParentAccount = NotEnoughBalanceInParentAccount;
+exports.NotEnoughBalanceToDelegate = NotEnoughBalanceToDelegate;
+exports.NotEnoughGas = NotEnoughGas;
+exports.NotEnoughSpendableBalance = NotEnoughSpendableBalance;
+exports.NotSupportedLegacyAddress = NotSupportedLegacyAddress;
+exports.PairingFailed = PairingFailed;
+exports.PasswordIncorrectError = PasswordIncorrectError;
+exports.PasswordsDontMatchError = PasswordsDontMatchError;
+exports.RecipientRequired = RecipientRequired;
+exports.RecommendSubAccountsToEmpty = RecommendSubAccountsToEmpty;
+exports.RecommendUndelegation = RecommendUndelegation;
+exports.StatusCodes = StatusCodes;
+exports.SyncError = SyncError;
+exports.TimeoutTagged = TimeoutTagged;
+exports.TransportError = TransportError;
+exports.TransportInterfaceNotAvailable = TransportInterfaceNotAvailable;
+exports.TransportOpenUserCancelled = TransportOpenUserCancelled;
+exports.TransportRaceCondition = TransportRaceCondition;
+exports.TransportStatusError = TransportStatusError;
+exports.TransportWebUSBGestureRequired = TransportWebUSBGestureRequired;
+exports.UnavailableTezosOriginatedAccountReceive = UnavailableTezosOriginatedAccountReceive;
+exports.UnavailableTezosOriginatedAccountSend = UnavailableTezosOriginatedAccountSend;
+exports.UnexpectedBootloader = UnexpectedBootloader;
+exports.UnknownMCU = UnknownMCU;
+exports.UpdateFetchFileFail = UpdateFetchFileFail;
+exports.UpdateIncorrectHash = UpdateIncorrectHash;
+exports.UpdateIncorrectSig = UpdateIncorrectSig;
+exports.UpdateYourApp = UpdateYourApp;
+exports.UserRefusedAddress = UserRefusedAddress;
+exports.UserRefusedAllowManager = UserRefusedAllowManager;
+exports.UserRefusedDeviceNameChange = UserRefusedDeviceNameChange;
+exports.UserRefusedFirmwareUpdate = UserRefusedFirmwareUpdate;
+exports.UserRefusedOnDevice = UserRefusedOnDevice;
+exports.WebsocketConnectionError = WebsocketConnectionError;
+exports.WebsocketConnectionFailed = WebsocketConnectionFailed;
+exports.WrongAppForCurrency = WrongAppForCurrency;
+exports.WrongDeviceForAccount = WrongDeviceForAccount;
+exports.addCustomErrorDeserializer = addCustomErrorDeserializer;
+exports.createCustomErrorClass = createCustomErrorClass;
+exports.deserializeError = deserializeError;
+exports.getAltStatusMessage = getAltStatusMessage;
+exports.serializeError = serializeError;
+
+},{}],11:[function(require,module,exports){
 (function (Buffer){
 "use strict";
 
@@ -1684,7 +2110,7 @@ Transport.ErrorMessage_ListenTimeout = "No Ledger device found (timeout)";
 Transport.ErrorMessage_NoDeviceFound = "No Ledger device found";
 
 }).call(this,require("buffer").Buffer)
-},{"@ledgerhq/errors":3,"buffer":16,"events":17}],11:[function(require,module,exports){
+},{"@ledgerhq/errors":10,"buffer":17,"events":18}],12:[function(require,module,exports){
 "use strict";
 
 Object.defineProperty(exports, "__esModule", {
@@ -1752,7 +2178,7 @@ if (typeof window !== "undefined") {
   window.__ledgerLogsListen = listen;
 }
 
-},{}],12:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
 'use strict'
 
 exports.byteLength = byteLength
@@ -1905,7 +2331,7 @@ function fromByteArray (uint8) {
   return parts.join('')
 }
 
-},{}],13:[function(require,module,exports){
+},{}],14:[function(require,module,exports){
 ;(function (globalObject) {
   'use strict';
 
@@ -4809,7 +5235,7 @@ function fromByteArray (uint8) {
   }
 })(this);
 
-},{}],14:[function(require,module,exports){
+},{}],15:[function(require,module,exports){
 (function (module, exports) {
   'use strict';
 
@@ -8238,9 +8664,9 @@ function fromByteArray (uint8) {
   };
 })(typeof module === 'undefined' || module, this);
 
-},{"buffer":15}],15:[function(require,module,exports){
+},{"buffer":16}],16:[function(require,module,exports){
 
-},{}],16:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 (function (Buffer){
 /*!
  * The buffer module from node.js, for the browser.
@@ -10021,7 +10447,7 @@ function numberIsNaN (obj) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"base64-js":12,"buffer":16,"ieee754":18}],17:[function(require,module,exports){
+},{"base64-js":13,"buffer":17,"ieee754":19}],18:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -10546,7 +10972,7 @@ function functionBindPolyfill(context) {
   };
 }
 
-},{}],18:[function(require,module,exports){
+},{}],19:[function(require,module,exports){
 exports.read = function (buffer, offset, isLE, mLen, nBytes) {
   var e, m
   var eLen = (nBytes * 8) - mLen - 1
@@ -10632,7 +11058,7 @@ exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128
 }
 
-},{}],19:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 (function (Buffer){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -10884,734 +11310,14 @@ function toBuffer(v) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"bn.js":14,"buffer":16}],20:[function(require,module,exports){
-'use strict';
-module.exports = require( './lib/u2f-api' );
-},{"./lib/u2f-api":22}],21:[function(require,module,exports){
-// Copyright 2014 Google Inc. All rights reserved
-//
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file or at
-// https://developers.google.com/open-source/licenses/bsd
-
-/**
- * @fileoverview The U2F api.
- */
-
+},{"bn.js":15,"buffer":17}],21:[function(require,module,exports){
 'use strict';
 
-/** Namespace for the U2F api.
- * @type {Object}
- */
-var u2f = u2f || {};
-
-module.exports = u2f; // Adaptation for u2f-api package
-
-/**
- * The U2F extension id
- * @type {string}
- * @const
- */
-u2f.EXTENSION_ID = 'kmendfapggjehodndflmmgagdbamhnfd';
-
-/**
- * Message types for messsages to/from the extension
- * @const
- * @enum {string}
- */
-u2f.MessageTypes = {
-  'U2F_REGISTER_REQUEST': 'u2f_register_request',
-  'U2F_SIGN_REQUEST': 'u2f_sign_request',
-  'U2F_REGISTER_RESPONSE': 'u2f_register_response',
-  'U2F_SIGN_RESPONSE': 'u2f_sign_response'
+module.exports = function() {
+  throw new Error(
+    'ws does not work in the browser. Browser clients must use the native ' +
+      'WebSocket object'
+  );
 };
 
-/**
- * Response status codes
- * @const
- * @enum {number}
- */
-u2f.ErrorCodes = {
-  'OK': 0,
-  'OTHER_ERROR': 1,
-  'BAD_REQUEST': 2,
-  'CONFIGURATION_UNSUPPORTED': 3,
-  'DEVICE_INELIGIBLE': 4,
-  'TIMEOUT': 5
-};
-
-/**
- * A message type for registration requests
- * @typedef {{
- *   type: u2f.MessageTypes,
- *   signRequests: Array.<u2f.SignRequest>,
- *   registerRequests: ?Array.<u2f.RegisterRequest>,
- *   timeoutSeconds: ?number,
- *   requestId: ?number
- * }}
- */
-u2f.Request;
-
-/**
- * A message for registration responses
- * @typedef {{
- *   type: u2f.MessageTypes,
- *   responseData: (u2f.Error | u2f.RegisterResponse | u2f.SignResponse),
- *   requestId: ?number
- * }}
- */
-u2f.Response;
-
-/**
- * An error object for responses
- * @typedef {{
- *   errorCode: u2f.ErrorCodes,
- *   errorMessage: ?string
- * }}
- */
-u2f.Error;
-
-/**
- * Data object for a single sign request.
- * @typedef {{
- *   version: string,
- *   challenge: string,
- *   keyHandle: string,
- *   appId: string
- * }}
- */
-u2f.SignRequest;
-
-/**
- * Data object for a sign response.
- * @typedef {{
- *   keyHandle: string,
- *   signatureData: string,
- *   clientData: string
- * }}
- */
-u2f.SignResponse;
-
-/**
- * Data object for a registration request.
- * @typedef {{
- *   version: string,
- *   challenge: string,
- *   appId: string
- * }}
- */
-u2f.RegisterRequest;
-
-/**
- * Data object for a registration response.
- * @typedef {{
- *   registrationData: string,
- *   clientData: string
- * }}
- */
-u2f.RegisterResponse;
-
-
-// Low level MessagePort API support
-
-/**
- * Call MessagePort disconnect
- */
-u2f.disconnect = function() {
-  if (u2f.port_ && u2f.port_.port_) {
-    u2f.port_.port_.disconnect();
-    u2f.port_ = null;
-  }
-};
-
-/**
- * Sets up a MessagePort to the U2F extension using the
- * available mechanisms.
- * @param {function((MessagePort|u2f.WrappedChromeRuntimePort_))} callback
- */
-u2f.getMessagePort = function(callback) {
-  if (typeof chrome != 'undefined' && chrome.runtime) {
-    // The actual message here does not matter, but we need to get a reply
-    // for the callback to run. Thus, send an empty signature request
-    // in order to get a failure response.
-    var msg = {
-      type: u2f.MessageTypes.U2F_SIGN_REQUEST,
-      signRequests: []
-    };
-    chrome.runtime.sendMessage(u2f.EXTENSION_ID, msg, function() {
-      if (!chrome.runtime.lastError) {
-        // We are on a whitelisted origin and can talk directly
-        // with the extension.
-        u2f.getChromeRuntimePort_(callback);
-      } else {
-        // chrome.runtime was available, but we couldn't message
-        // the extension directly, use iframe
-        u2f.getIframePort_(callback);
-      }
-    });
-  } else {
-    // chrome.runtime was not available at all, which is normal
-    // when this origin doesn't have access to any extensions.
-    u2f.getIframePort_(callback);
-  }
-};
-
-/**
- * Connects directly to the extension via chrome.runtime.connect
- * @param {function(u2f.WrappedChromeRuntimePort_)} callback
- * @private
- */
-u2f.getChromeRuntimePort_ = function(callback) {
-  var port = chrome.runtime.connect(u2f.EXTENSION_ID,
-    {'includeTlsChannelId': true});
-  setTimeout(function() {
-    callback(null, new u2f.WrappedChromeRuntimePort_(port));
-  }, 0);
-};
-
-/**
- * A wrapper for chrome.runtime.Port that is compatible with MessagePort.
- * @param {Port} port
- * @constructor
- * @private
- */
-u2f.WrappedChromeRuntimePort_ = function(port) {
-  this.port_ = port;
-};
-
-/**
- * Posts a message on the underlying channel.
- * @param {Object} message
- */
-u2f.WrappedChromeRuntimePort_.prototype.postMessage = function(message) {
-  this.port_.postMessage(message);
-};
-
-/**
- * Emulates the HTML 5 addEventListener interface. Works only for the
- * onmessage event, which is hooked up to the chrome.runtime.Port.onMessage.
- * @param {string} eventName
- * @param {function({data: Object})} handler
- */
-u2f.WrappedChromeRuntimePort_.prototype.addEventListener =
-    function(eventName, handler) {
-  var name = eventName.toLowerCase();
-  if (name == 'message' || name == 'onmessage') {
-    this.port_.onMessage.addListener(function(message) {
-      // Emulate a minimal MessageEvent object
-      handler({'data': message});
-    });
-  } else {
-    console.error('WrappedChromeRuntimePort only supports onMessage');
-  }
-};
-
-/**
- * Sets up an embedded trampoline iframe, sourced from the extension.
- * @param {function(MessagePort)} callback
- * @private
- */
-u2f.getIframePort_ = function(callback) {
-  // Create the iframe
-  var iframeOrigin = 'chrome-extension://' + u2f.EXTENSION_ID;
-  var iframe = document.createElement('iframe');
-  iframe.src = iframeOrigin + '/u2f-comms.html';
-  iframe.setAttribute('style', 'display:none');
-  document.body.appendChild(iframe);
-
-  var hasCalledBack = false;
-
-  var channel = new MessageChannel();
-  var ready = function(message) {
-    if (message.data == 'ready') {
-      channel.port1.removeEventListener('message', ready);
-      if (!hasCalledBack)
-      {
-        hasCalledBack = true;
-        callback(null, channel.port1);
-      }
-    } else {
-      console.error('First event on iframe port was not "ready"');
-    }
-  };
-  channel.port1.addEventListener('message', ready);
-  channel.port1.start();
-
-  iframe.addEventListener('load', function() {
-    // Deliver the port to the iframe and initialize
-    iframe.contentWindow.postMessage('init', iframeOrigin, [channel.port2]);
-  });
-
-  // Give this 200ms to initialize, after that, we treat this method as failed
-  setTimeout(function() {
-    if (!hasCalledBack)
-    {
-      hasCalledBack = true;
-      callback(new Error("IFrame extension not supported"));
-    }
-  }, 200);
-};
-
-
-// High-level JS API
-
-/**
- * Default extension response timeout in seconds.
- * @const
- */
-u2f.EXTENSION_TIMEOUT_SEC = 30;
-
-/**
- * A singleton instance for a MessagePort to the extension.
- * @type {MessagePort|u2f.WrappedChromeRuntimePort_}
- * @private
- */
-u2f.port_ = null;
-
-/**
- * Callbacks waiting for a port
- * @type {Array.<function((MessagePort|u2f.WrappedChromeRuntimePort_))>}
- * @private
- */
-u2f.waitingForPort_ = [];
-
-/**
- * A counter for requestIds.
- * @type {number}
- * @private
- */
-u2f.reqCounter_ = 0;
-
-/**
- * A map from requestIds to client callbacks
- * @type {Object.<number,(function((u2f.Error|u2f.RegisterResponse))
- *                       |function((u2f.Error|u2f.SignResponse)))>}
- * @private
- */
-u2f.callbackMap_ = {};
-
-/**
- * Creates or retrieves the MessagePort singleton to use.
- * @param {function((MessagePort|u2f.WrappedChromeRuntimePort_))} callback
- * @private
- */
-u2f.getPortSingleton_ = function(callback) {
-  if (u2f.port_) {
-    callback(null, u2f.port_);
-  } else {
-    if (u2f.waitingForPort_.length == 0) {
-      u2f.getMessagePort(function(err, port) {
-        if (!err) {
-          u2f.port_ = port;
-          u2f.port_.addEventListener('message',
-            /** @type {function(Event)} */ (u2f.responseHandler_));
-        }
-
-        // Careful, here be async callbacks. Maybe.
-        while (u2f.waitingForPort_.length)
-          u2f.waitingForPort_.shift()(err, port);
-      });
-    }
-    u2f.waitingForPort_.push(callback);
-  }
-};
-
-/**
- * Handles response messages from the extension.
- * @param {MessageEvent.<u2f.Response>} message
- * @private
- */
-u2f.responseHandler_ = function(message) {
-  var response = message.data;
-  var reqId = response['requestId'];
-  if (!reqId || !u2f.callbackMap_[reqId]) {
-    console.error('Unknown or missing requestId in response.');
-    return;
-  }
-  var cb = u2f.callbackMap_[reqId];
-  delete u2f.callbackMap_[reqId];
-  cb(null, response['responseData']);
-};
-
-/**
- * Calls the callback with true or false as first and only argument
- * @param {Function} callback
- */
-u2f.isSupported = function(callback) {
-  u2f.getPortSingleton_(function(err, port) {
-    callback(!err);
-  });
-}
-
-/**
- * Dispatches an array of sign requests to available U2F tokens.
- * @param {Array.<u2f.SignRequest>} signRequests
- * @param {function((u2f.Error|u2f.SignResponse))} callback
- * @param {number=} opt_timeoutSeconds
- */
-u2f.sign = function(signRequests, callback, opt_timeoutSeconds) {
-  u2f.getPortSingleton_(function(err, port) {
-    if (err)
-      return callback(err);
-
-    var reqId = ++u2f.reqCounter_;
-    u2f.callbackMap_[reqId] = callback;
-    var req = {
-      type: u2f.MessageTypes.U2F_SIGN_REQUEST,
-      signRequests: signRequests,
-      timeoutSeconds: (typeof opt_timeoutSeconds !== 'undefined' ?
-        opt_timeoutSeconds : u2f.EXTENSION_TIMEOUT_SEC),
-      requestId: reqId
-    };
-    port.postMessage(req);
-  });
-};
-
-/**
- * Dispatches register requests to available U2F tokens. An array of sign
- * requests identifies already registered tokens.
- * @param {Array.<u2f.RegisterRequest>} registerRequests
- * @param {Array.<u2f.SignRequest>} signRequests
- * @param {function((u2f.Error|u2f.RegisterResponse))} callback
- * @param {number=} opt_timeoutSeconds
- */
-u2f.register = function(registerRequests, signRequests,
-    callback, opt_timeoutSeconds) {
-  u2f.getPortSingleton_(function(err, port) {
-    if (err)
-      return callback(err);
-
-    var reqId = ++u2f.reqCounter_;
-    u2f.callbackMap_[reqId] = callback;
-    var req = {
-      type: u2f.MessageTypes.U2F_REGISTER_REQUEST,
-      signRequests: signRequests,
-      registerRequests: registerRequests,
-      timeoutSeconds: (typeof opt_timeoutSeconds !== 'undefined' ?
-        opt_timeoutSeconds : u2f.EXTENSION_TIMEOUT_SEC),
-      requestId: reqId
-    };
-    port.postMessage(req);
-  });
-};
-
-},{}],22:[function(require,module,exports){
-(function (global){
-'use strict';
-
-module.exports = API;
-
-var chromeApi = require( './google-u2f-api' );
-
-// Feature detection (yes really)
-var isBrowser = ( typeof navigator !== 'undefined' ) && !!navigator.userAgent;
-var isSafari = isBrowser && navigator.userAgent.match( /Safari\// )
-	&& !navigator.userAgent.match( /Chrome\// );
-var isEDGE = isBrowser && navigator.userAgent.match( /Edge\/1[2345]/ );
-
-var _backend = null;
-function getBackend( Promise )
-{
-	if ( !_backend )
-		_backend = new Promise( function( resolve, reject )
-		{
-			function notSupported( )
-			{
-				// Note; {native: true} means *not* using Google's hack
-				resolve( { u2f: null, native: true } );
-			}
-
-			if ( !isBrowser )
-				return notSupported( );
-
-			if ( isSafari )
-				// Safari doesn't support U2F, and the Safari-FIDO-U2F
-				// extension lacks full support (Multi-facet apps), so we
-				// block it until proper support.
-				return notSupported( );
-
-			var hasNativeSupport =
-				( typeof window.u2f !== 'undefined' ) &&
-				( typeof window.u2f.sign === 'function' );
-
-			if ( hasNativeSupport )
-				resolve( { u2f: window.u2f, native: true } );
-
-			if ( isEDGE )
-				// We don't want to check for Google's extension hack on EDGE
-				// as it'll cause trouble (popups, etc)
-				return notSupported( );
-
-			if ( location.protocol === 'http:' )
-				// U2F isn't supported over http, only https
-				return notSupported( );
-
-			if ( typeof MessageChannel === 'undefined' )
-				// Unsupported browser, the chrome hack would throw
-				return notSupported( );
-
-			// Test for google extension support
-			chromeApi.isSupported( function( ok )
-			{
-				if ( ok )
-					resolve( { u2f: chromeApi, native: false } );
-				else
-					notSupported( );
-			} );
-		} );
-
-	return _backend;
-}
-
-function API( Promise )
-{
-	return {
-		isSupported   : isSupported.bind( Promise ),
-		ensureSupport : ensureSupport.bind( Promise ),
-		register      : register.bind( Promise ),
-		sign          : sign.bind( Promise ),
-		ErrorCodes    : API.ErrorCodes,
-		ErrorNames    : API.ErrorNames
-	};
-}
-
-API.ErrorCodes = {
-	CANCELLED: -1,
-	OK: 0,
-	OTHER_ERROR: 1,
-	BAD_REQUEST: 2,
-	CONFIGURATION_UNSUPPORTED: 3,
-	DEVICE_INELIGIBLE: 4,
-	TIMEOUT: 5
-};
-API.ErrorNames = {
-	"-1": "CANCELLED",
-	"0": "OK",
-	"1": "OTHER_ERROR",
-	"2": "BAD_REQUEST",
-	"3": "CONFIGURATION_UNSUPPORTED",
-	"4": "DEVICE_INELIGIBLE",
-	"5": "TIMEOUT"
-};
-
-function makeError( msg, err )
-{
-	var code = err != null ? err.errorCode : 1; // Default to OTHER_ERROR
-	var type = API.ErrorNames[ '' + code ];
-	var error = new Error( msg );
-	error.metaData = {
-		type: type,
-		code: code
-	}
-	return error;
-}
-
-function deferPromise( Promise, promise )
-{
-	var ret = { };
-	ret.promise = new Promise( function( resolve, reject ) {
-		ret.resolve = resolve;
-		ret.reject = reject;
-		promise.then( resolve, reject );
-	} );
-	/**
-	 * Reject request promise and disconnect port if 'disconnect' flag is true
-	 * @param {string} msg
-	 * @param {boolean} disconnect
-	 */
-	ret.promise.cancel = function( msg, disconnect )
-	{
-		getBackend( Promise )
-		.then( function( backend )
-		{
-			if ( disconnect && !backend.native )
-				backend.u2f.disconnect( );
-
-			ret.reject( makeError( msg, { errorCode: -1 } ) );
-		} );
-	};
-	return ret;
-}
-
-function defer( Promise, fun )
-{
-	return deferPromise( Promise, new Promise( function( resolve, reject )
-	{
-		try
-		{
-			fun && fun( resolve, reject );
-		}
-		catch ( err )
-		{
-			reject( err );
-		}
-	} ) );
-}
-
-function isSupported( )
-{
-	var Promise = this;
-
-	return getBackend( Promise )
-	.then( function( backend )
-	{
-		return !!backend.u2f;
-	} );
-}
-
-function _ensureSupport( backend )
-{
-	if ( !backend.u2f )
-	{
-		if ( location.protocol === 'http:' )
-			throw new Error( "U2F isn't supported over http, only https" );
-		throw new Error( "U2F not supported" );
-	}
-}
-
-function ensureSupport( )
-{
-	var Promise = this;
-
-	return getBackend( Promise )
-	.then( _ensureSupport );
-}
-
-function register( registerRequests, signRequests /* = null */, timeout )
-{
-	var Promise = this;
-
-	if ( !Array.isArray( registerRequests ) )
-		registerRequests = [ registerRequests ];
-
-	if ( typeof signRequests === 'number' && typeof timeout === 'undefined' )
-	{
-		timeout = signRequests;
-		signRequests = null;
-	}
-
-	if ( !signRequests )
-		signRequests = [ ];
-
-	return deferPromise( Promise, getBackend( Promise )
-	.then( function( backend )
-	{
-		_ensureSupport( backend );
-
-		var native = backend.native;
-		var u2f = backend.u2f;
-
-		return new Promise( function( resolve, reject )
-		{
-			function cbNative( response )
-			{
-				if ( response.errorCode )
-					reject( makeError( "Registration failed", response ) );
-				else
-				{
-					delete response.errorCode;
-					resolve( response );
-				}
-			}
-
-			function cbChrome( err, response )
-			{
-				if ( err )
-					reject( err );
-				else if ( response.errorCode )
-					reject( makeError( "Registration failed", response ) );
-				else
-					resolve( response );
-			}
-
-			if ( native )
-			{
-				var appId = registerRequests[ 0 ].appId;
-
-				u2f.register(
-					appId, registerRequests, signRequests, cbNative, timeout );
-			}
-			else
-			{
-				u2f.register(
-					registerRequests, signRequests, cbChrome, timeout );
-			}
-		} );
-	} ) ).promise;
-}
-
-function sign( signRequests, timeout )
-{
-	var Promise = this;
-
-	if ( !Array.isArray( signRequests ) )
-		signRequests = [ signRequests ];
-
-	return deferPromise( Promise, getBackend( Promise )
-	.then( function( backend )
-	{
-		_ensureSupport( backend );
-
-		var native = backend.native;
-		var u2f = backend.u2f;
-
-		return new Promise( function( resolve, reject )
-		{
-			function cbNative( response )
-			{
-				if ( response.errorCode )
-					reject( makeError( "Sign failed", response ) );
-				else
-				{
-					delete response.errorCode;
-					resolve( response );
-				}
-			}
-
-			function cbChrome( err, response )
-			{
-				if ( err )
-					reject( err );
-				else if ( response.errorCode )
-					reject( makeError( "Sign failed", response ) );
-				else
-					resolve( response );
-			}
-
-			if ( native )
-			{
-				var appId = signRequests[ 0 ].appId;
-				var challenge = signRequests[ 0 ].challenge;
-
-				u2f.sign( appId, challenge, signRequests, cbNative, timeout );
-			}
-			else
-			{
-				u2f.sign( signRequests, cbChrome, timeout );
-			}
-		} );
-	} ) ).promise;
-}
-
-function makeDefault( func )
-{
-	API[ func ] = function( )
-	{
-		if ( !global.Promise )
-			// This is very unlikely to ever happen, since browsers
-			// supporting U2F will most likely support Promises.
-			throw new Error( "The platform doesn't natively support promises" );
-
-		var args = [ ].slice.call( arguments );
-		return API( global.Promise )[ func ].apply( null, args );
-	};
-}
-
-// Provide default functions using the built-in Promise if available.
-makeDefault( 'isSupported' );
-makeDefault( 'ensureSupport' );
-makeDefault( 'register' );
-makeDefault( 'sign' );
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./google-u2f-api":21}]},{},[2]);
+},{}]},{},[2]);
