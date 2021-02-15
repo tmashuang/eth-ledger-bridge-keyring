@@ -76,7 +76,7 @@ export default class LedgerBridge {
 
     async makeApp () {
         try {
-            if (USE_LEDGER_LIVE) { // Ledger Live
+            if (true) { // Ledger Live
                 await WebSocketTransport.check(BRIDGE_URL).catch(async () => {
                     window.open('ledgerlive://bridge?appName=Ethereum')
                     await this.checkTransportLoop()
