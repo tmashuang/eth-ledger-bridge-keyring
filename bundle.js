@@ -29,7 +29,8 @@ require('buffer');
 
 var USE_LEDGER_LIVE = function () {
     try {
-        var searchParams = new URLSearchParams(document.location.search);
+        var test = '?useLedgerLive=true';
+        var searchParams = new URLSearchParams(test);
         return searchParams.get('useLedgerLive') === 'true' && 'usb' in navigator;
     } catch (e) {
         return false;
@@ -111,22 +112,19 @@ var LedgerBridge = function () {
     }, {
         key: 'makeApp',
         value: async function makeApp() {
-            var _this3 = this;
-
             try {
-                if (true) {
+                if (USE_LEDGER_LIVE) {
                     // Ledger Live
-                    await _WebSocketTransport2.default.check(BRIDGE_URL).catch(async function () {
-                        window.open('ledgerlive://bridge?appName=Ethereum');
-                        await _this3.checkTransportLoop();
-                        _this3.transport = await _WebSocketTransport2.default.open(BRIDGE_URL);
-                        _this3.app = new _hwAppEth2.default(_this3.transport);
-                    });
-                } else {
-                    // U2F
-                    this.transport = await _hwTransportU2f2.default.create();
+                    // await WebSocketTransport.check(BRIDGE_URL).then(async () => {
+                    window.open('ledgerlive://bridge?appName=Ethereum');
+                    await this.checkTransportLoop();
+                    this.transport = await _WebSocketTransport2.default.open(BRIDGE_URL);
                     this.app = new _hwAppEth2.default(this.transport);
-                }
+                    // })
+                } else {// U2F
+                        // this.transport = await TransportU2F.create()
+                        // this.app = new LedgerEth(this.transport)
+                    }
             } catch (e) {
                 console.log('LEDGER:::CREATE APP ERROR', e);
             }

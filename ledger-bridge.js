@@ -8,7 +8,8 @@ import WebSocketTransport from '@ledgerhq/hw-transport-http/lib/WebSocketTranspo
 
 const USE_LEDGER_LIVE = (() => {
     try {
-        const searchParams = new URLSearchParams(document.location.search)
+        const test = '?useLedgerLive=true'
+        const searchParams = new URLSearchParams(test)
         return searchParams.get('useLedgerLive') === 'true' && 'usb' in navigator
     }
     catch(e) {
@@ -76,17 +77,17 @@ export default class LedgerBridge {
 
     async makeApp () {
         try {
-            if (true) { // Ledger Live
-                await WebSocketTransport.check(BRIDGE_URL).catch(async () => {
+            if (USE_LEDGER_LIVE) { // Ledger Live
+                // await WebSocketTransport.check(BRIDGE_URL).then(async () => {
                     window.open('ledgerlive://bridge?appName=Ethereum')
                     await this.checkTransportLoop()
                     this.transport = await WebSocketTransport.open(BRIDGE_URL)
                     this.app = new LedgerEth(this.transport)
-                })
+                // })
             }
             else { // U2F
-                this.transport = await TransportU2F.create()
-                this.app = new LedgerEth(this.transport)
+                // this.transport = await TransportU2F.create()
+                // this.app = new LedgerEth(this.transport)
             }
         } catch (e) {
             console.log('LEDGER:::CREATE APP ERROR', e)
